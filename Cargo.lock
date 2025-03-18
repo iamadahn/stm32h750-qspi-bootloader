@@ -317,7 +317,7 @@ dependencies = [
  "rand_core",
  "sdio-host",
  "static_assertions",
- "stm32-fmc",
+ "stm32-fmc 0.3.2",
  "stm32-metapac",
  "vcell",
  "volatile-register",
@@ -699,6 +699,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "stm32-fmc"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72692594faa67f052e5e06dd34460951c21e83bc55de4feb8d2666e2f15480a2"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
 name = "stm32-metapac"
 version = "16.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -722,10 +731,12 @@ dependencies = [
  "embassy-sync",
  "embassy-time",
  "embedded-hal 1.0.0",
+ "embedded-storage",
  "heapless",
  "nb 1.1.0",
  "panic-probe",
  "static_cell",
+ "stm32-fmc 0.4.0",
 ]
 
 [[package]]
