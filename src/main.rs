@@ -14,6 +14,7 @@ use embassy_stm32::qspi::{
 use embassy_stm32::qspi::enums::{
     AddressSize, ChipSelectHighTime, DummyCycles, FIFOThresholdLevel, MemorySize, QspiWidth,
 };
+use embassy_stm32::peripherals::QUADSPI;
 use {defmt_rtt as _, panic_probe as _};
 
 #[embassy_executor::main]
@@ -52,11 +53,11 @@ async fn main(_spawner: Spawner) -> ! {
     let mut led = Output::new(p.PE3, Level::High, Speed::Low);
 
     let qspi_config = embassy_stm32::qspi::Config {
-        fifo_threshold: FIFOThresholdLevel::_16Bytes,
-        address_size: AddressSize::_32bit,
+        fifo_threshold: FIFOThresholdLevel::_4Bytes,
+        address_size: AddressSize::_24bit,
         memory_size: MemorySize::_8MiB,
-        cs_high_time: ChipSelectHighTime::_1Cycle,
-        prescaler: 4,
+        cs_high_time: ChipSelectHighTime::_5Cycle,
+        prescaler: 2,
     };
     let qspi = embassy_stm32::qspi::Qspi::new_blocking_bank1(
         p.QUADSPI,
@@ -92,7 +93,7 @@ async fn main(_spawner: Spawner) -> ! {
     let second_u32 = unsafe { *(0x90000004 as *const u32) };
     assert_eq!(second_u32, 0x07060504);
 
-    info!("DONE");
+    info!("OH MY GOD - {:X} {:X}", first_u32, second_u32);
 
     loop {
         led.toggle();
@@ -128,12 +129,162 @@ const CMD_WRITE_CR: u8 = 0x31;
 /// Implementation of access to flash chip.
 /// Chip commands are hardcoded as it depends on used chip.
 /// This implementation is using chip GD25Q64C from Giga Device
-pub struct FlashMemory<I: Instance> {
-    qspi: Qspi<'static, I, Blocking>,
+
+const W25QXX_EXIT_QSPI_MODE: u8 = 0xFF;
+const W25QXX_ENTER_QSPI_MODE: u8 = 0x38;
+const W25QXX_SET_READ_PARAMETERS: u8 = 0xC0; //QSPI mode only
+
+const W25X_READ_STATUS_REG1: u8 = 0x05;
+const W25X_READ_STATUS_REG2: u8 = 0x35;
+const W25X_READ_STATUS_REG3: u8 = 0x15;
+
+const W25X_WRITE_STATUS_REG1: u8 = 0x01; // Reg1 Reg2
+const W25X_WRITE_STATUS_REG2: u8 = 0x01; // 0x31
+const W25X_WRITE_STATUS_REG3: u8 = 0x01; // 0x11
+
+const W25X_WRITE_ENABLE: u8 = 0x06;
+const W25X_WRITE_DISABLE: u8 = 0x04;
+
+// 添加W25QXX复位相关命令常量
+const W25X_ENABLE_RESET: u8 = 0x66;
+const W25X_RESET_DEVICE: u8 = 0x99;
+
+// W25QXX读写相关命令
+const W25X_FAST_READ_QUAD_IO: u8 = 0xEB; // 快速四线IO读取命令
+
+// QE位掩码（用于检查四线模式使能）
+const QE_MASK: u8 = 0x02; // 状态寄存器2中的QE位
+
+// busy位掩码
+const BUSY_MASK: u8 = 0x01;
+
+fn w25qxx_read_sr(qspi: &mut Qspi<QUADSPI, Blocking>, srx: u8, is_qpi_mode: bool) -> u8 {
+    // 选择要读取的状态寄存器指令
+    let instruction = match srx {
+        1 => W25X_READ_STATUS_REG1,
+        2 => W25X_READ_STATUS_REG2,
+        3 => W25X_READ_STATUS_REG3,
+        _ => W25X_READ_STATUS_REG1, // 默认读取状态寄存器1
+    };
+    // 根据当前模式配置通信方式
+    let (iwidth, dwidth) = if is_qpi_mode {
+        (QspiWidth::QUAD, QspiWidth::QUAD)
+    } else {
+        (QspiWidth::SING, QspiWidth::SING)
+    };
+
+    let transaction = TransferConfig {
+        iwidth,
+        awidth: QspiWidth::NONE,
+        dwidth,
+        instruction,
+        address: None,
+        dummy: DummyCycles::_0,
+    };
+
+    // 创建接收缓冲区
+    let mut data = [0u8; 1];
+    
+    // 执行读取操作
+    qspi.blocking_read(&mut data, transaction);
+    
+    // 返回读取到的状态值
+    data[0]
 }
 
-impl<I: Instance> FlashMemory<I> {
-    pub async fn new(qspi: Qspi<'static, I, Blocking>) -> Self {
+fn w25qxx_write_sr(qspi: &mut Qspi<QUADSPI, Blocking>, srx: u8, value: u8, is_qpi_mode: bool) {
+    // 选择要写入的状态寄存器指令
+    let instruction = match srx {
+        1 => W25X_WRITE_STATUS_REG1,
+        2 => W25X_WRITE_STATUS_REG2,
+        3 => W25X_WRITE_STATUS_REG3,
+        _ => W25X_WRITE_STATUS_REG1, // 默认写状态寄存器1
+    };
+    // 根据当前模式配置通信方式
+    let (iwidth, dwidth) = if is_qpi_mode {
+        (QspiWidth::QUAD, QspiWidth::QUAD)
+    } else {
+        (QspiWidth::SING, QspiWidth::SING)
+    };
+
+        // 先发送写使能指令
+    w25qxx_write_enable(qspi, is_qpi_mode);
+
+    let transaction = TransferConfig {
+        iwidth,
+        awidth: QspiWidth::NONE,
+        dwidth,
+        instruction,
+        address: None,
+        dummy: DummyCycles::_0,
+    };
+
+    // 创建发送缓冲区
+    let data = [value];
+
+    // 执行写入操作
+    qspi.blocking_write(&data, transaction);
+}
+
+fn w25qxx_write_enable(qspi: &mut Qspi<QUADSPI, Blocking>, is_qpi_mode: bool) {
+    let iwidth = if is_qpi_mode {
+        QspiWidth::QUAD
+    } else {
+        QspiWidth::SING
+    };
+
+    let transaction = TransferConfig {
+        iwidth,
+        awidth: QspiWidth::NONE,
+        dwidth: QspiWidth::NONE,
+        instruction: CMD_WRITE_ENABLE,
+        address: None,
+        dummy: DummyCycles::_0,
+    };
+
+    qspi.blocking_command(transaction);
+}
+
+fn w25qxx_enter_qspi_mode(qspi: &mut Qspi<QUADSPI, Blocking>) {
+    // 1. 检查并设置QE位（需要实现读写状态寄存器的函数）
+    let status = w25qxx_read_sr(qspi, 2, false);
+    if (status & QE_MASK) == 0 {
+        // QE位未设置，需要设置
+        w25qxx_write_sr(qspi, 2, status | QE_MASK, false);
+    }
+
+    // 2. 进入QSPI模式
+    let transaction = TransferConfig {
+        iwidth: QspiWidth::SING,
+        awidth: QspiWidth::NONE,
+        dwidth: QspiWidth::NONE,
+        instruction: W25QXX_ENTER_QSPI_MODE,
+        address: None,
+        dummy: DummyCycles::_0,
+    };
+    qspi.blocking_command(transaction);
+    // 3. 设置读参数
+    let transaction = TransferConfig {
+        iwidth: QspiWidth::QUAD,
+        awidth: QspiWidth::NONE,
+        dwidth: QspiWidth::QUAD,
+        instruction: W25QXX_SET_READ_PARAMETERS,
+        address: None,
+        dummy: DummyCycles::_0,
+    };
+
+    // 先发送写使能指令（在QPI模式下）
+    w25qxx_write_enable(qspi, true);
+    let data: [u8; 1] = [0x03 << 4];
+    qspi.blocking_write(&data, transaction);
+}
+
+pub struct FlashMemory {
+    qspi: Qspi<'static, QUADSPI, Blocking>,
+}
+
+impl FlashMemory {
+    pub async fn new(qspi: Qspi<'static, QUADSPI, Blocking>) -> Self {
         let mut memory = Self { qspi };
 
         memory.reset_memory().await;
@@ -141,47 +292,23 @@ impl<I: Instance> FlashMemory<I> {
         memory
     }
 
-    async fn qpi_mode(&mut self) {
-        // Enter qpi mode
-        self.exec_command(0x38).await;
-
-        // Set read param
-        let transaction = TransferConfig {
-            iwidth: QspiWidth::SING,
-            dwidth: QspiWidth::QUAD,
-            instruction: 0xC0 as u8,
-            ..Default::default()
-        };
-        self.enable_write().await;
-        self.qspi.blocking_write(&[0x30_u8], transaction);
-        self.wait_write_finish();
-    }
-
     pub async fn enable_mm(&mut self) {
-        self.qpi_mode().await;
+        w25qxx_enter_qspi_mode(&mut self.qspi);
 
-        let read_config = TransferConfig {
-            iwidth: QspiWidth::SING,
-            awidth: QspiWidth::SING,
+        // 在embassy-stm32库中，我们需要使用memory_mapped方法来配置并启用内存映射模式
+        let config = TransferConfig {
+            instruction: W25X_FAST_READ_QUAD_IO,
+            iwidth: QspiWidth::QUAD,
+            awidth: QspiWidth::QUAD,
             dwidth: QspiWidth::QUAD,
-            instruction: 0x0B, // Fast read in QPI mode
+            address: Some(24), // 24位地址
             dummy: DummyCycles::_8,
-            ..Default::default()
+            // SIOO模式表示是否每条指令都发送指令码
+            // 在embassy-stm32中，可能没有直接对应选项，使用最接近的设置
         };
 
-        self.qspi.enable_memory_map(&read_config);
-
-        /*
-        let write_config = TransferConfig {
-            iwidth: QspiWidth::SING,
-            awidth: QspiWidth::SING,
-            dwidth: QspiWidth::QUAD,
-            instruction: 0x32, // Write config
-            dummy: DummyCycles::_0,
-            ..Default::default()
-        };
-        self.qspi.enable_memory_map(&write_config);
-        */
+        // 启用内存映射模式
+        self.qspi.enable_memory_map(&config);
     }
 
     fn enable_quad(&mut self) {
