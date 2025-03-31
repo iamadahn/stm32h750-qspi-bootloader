@@ -1,2 +1,4 @@
-# stm32h750-iamboot
-STM32H750VB iamboot bootloader. App runs from QSPI external flash, supports firmware upgrade over USART.
+# stm32h750-qspi-memorymap
+WeAct Studio STM32H750VBT6 board.
+
+External QSPI flash memory in memory mapped mode example.
