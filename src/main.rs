@@ -14,6 +14,12 @@ use embassy_stm32::qspi::{
 use embassy_stm32::qspi::enums::{
     AddressSize, ChipSelectHighTime, DummyCycles, FIFOThresholdLevel, MemorySize, QspiWidth,
 };
+use embedded_storage::nor_flash::{NorFlash, ReadNorFlash, ErrorType, NorFlashError, NorFlashErrorKind};
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_boot::*;
+
+use core::cell::RefCell;
+
 use {defmt_rtt as _, panic_probe as _};
 
 #[embassy_executor::main]
@@ -73,26 +79,20 @@ async fn main(_spawner: Spawner) -> ! {
 
     let flash_id = flash.read_id();
     info!("FLASH ID: {=[u8]:x}", flash_id);
-    let mut wr_buf = [0xFFu8; 8];
-    for i in 0..8 {
-        wr_buf[i] = i as u8;
-    }
-    let mut rd_buf = [0u8; 16];
-    flash.erase_sector(0).await;
-    flash.write_memory(0, &wr_buf).await;
-    flash.read_memory(0, &mut rd_buf);
-    info!("WRITE BUF: {=[u8]:#X}", wr_buf);
-    info!("READ BUF: {=[u8]:#X}", rd_buf);
     flash.enable_mm().await;
     info!("Enabled memory mapped mode");
 
-    let first_u32 = unsafe { *(0x90000000 as *const u32) };
-    assert_eq!(first_u32, 0x03020100);
+    let qspi_flash = Mutex::new(RefCell::new(flash));
 
-    let second_u32 = unsafe { *(0x90000004 as *const u32) };
-    assert_eq!(second_u32, 0x07060504);
+    info!("qspi_flash");
 
-    info!("OH MY GOD - {:X} {:X}", first_u32, second_u32);
+    let config = BootLoaderConfig::from_linkerfile_blocking(&qspi_flash, &qspi_flash, &qspi_flash);
+    info!("config");
+
+    let active_offset = config.active.offset();
+    info!("active_offset: {:08x}", active_offset);
+
+    let target_addr = active_offset;
 
     loop {
         led.toggle();
@@ -135,11 +135,12 @@ const QE_MASK: u8 = 0x02;
 pub struct FlashMemory<I: Instance> {
     qspi: Qspi<'static, I, Blocking>,
     qpi_mode: bool,
+    base_address: u32,
 }
 
 impl<I: Instance> FlashMemory<I> {
     pub async fn new(qspi: Qspi<'static, I, Blocking>) -> Self {
-        let mut memory = Self { qspi, qpi_mode: false };
+        let mut memory = Self { qspi, qpi_mode: false, base_address: 0x9000_0000 };
 
         memory.reset_memory().await;
         memory.enable_quad();
@@ -412,5 +413,128 @@ impl<I: Instance> FlashMemory<I> {
 
     pub fn write_sr(&mut self, value: u8) {
         self.write_register(CMD_WRITE_STATUS_REG1, value);
+    }
+}
+
+#[derive(Debug)]
+pub enum QspiError {
+    NotAligned,
+    OutOfBounds,
+    WriteError,
+    EraseError,
+    ReadError,
+    NotReady,
+}
+
+impl NorFlashError for QspiError {
+    fn kind(&self) -> NorFlashErrorKind {
+        match self {
+            QspiError::NotAligned => NorFlashErrorKind::NotAligned,
+            QspiError::OutOfBounds => NorFlashErrorKind::OutOfBounds,
+            QspiError::WriteError | QspiError::EraseError | 
+            QspiError::ReadError | QspiError::NotReady => NorFlashErrorKind::Other,
+        }
+    }
+}
+
+impl<'d, I: Instance> ErrorType for FlashMemory<I> {
+    type Error = QspiError;
+}
+
+impl<'d, I: Instance> ReadNorFlash for FlashMemory<I> {
+    const READ_SIZE: usize = 1;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        if (offset as usize + bytes.len()) > (self.capacity() + self.base_address as usize) {
+            return Err(QspiError::OutOfBounds);
+        }
+        let src_ptr = offset as *const u8;
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            unsafe {
+                *byte = core::ptr::read_volatile(src_ptr.add(i));
+            }
+        }
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        8 * 1024 * 1024
+    }
+}
+
+impl<'d, I: Instance> NorFlash for FlashMemory<I> {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = 4096;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        if from > to || (to as usize) > self.capacity() {
+            return Err(QspiError::OutOfBounds);
+        }
+
+        let start_sector = from / Self::ERASE_SIZE as u32;
+        let end_sector = to / Self::ERASE_SIZE as u32;
+
+        for sector in start_sector..=end_sector {
+            let sector_addr = sector * Self::ERASE_SIZE as u32;
+
+            self.write_enable();
+
+            let iwidth = if self.qpi_mode { QspiWidth::QUAD } else { QspiWidth::SING };
+            let transaction = TransferConfig {
+                iwidth,
+                awidth: if self.qpi_mode { QspiWidth::QUAD } else { QspiWidth::SING },
+                dwidth: QspiWidth::NONE,
+                instruction: CMD_SECTOR_ERASE,
+                address: Some(sector_addr),
+                dummy: DummyCycles::_0,
+            };
+
+            self.qspi.blocking_command(transaction);
+
+            self.wait_write_finish();
+        }
+
+        Ok(())
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        if (offset as usize + bytes.len()) > self.capacity() {
+            return Err(QspiError::OutOfBounds);
+        }
+
+        const PAGE_SIZE: usize = 256;
+
+        let mut remaining = bytes.len();
+        let mut src_offset = 0;
+        let mut dst_offset = offset;
+
+        while remaining > 0 {
+            let current_page = (dst_offset as usize) / PAGE_SIZE;
+            let bytes_in_page = ((current_page + 1) * PAGE_SIZE) - (dst_offset as usize);
+            let to_write = core::cmp::min(remaining, bytes_in_page);
+
+            self.write_enable();
+
+            let iwidth = if self.qpi_mode { QspiWidth::QUAD } else { QspiWidth::SING };
+            let cmd = if self.qpi_mode { CMD_QUAD_WRITE_PG } else { QE_MASK };
+            let transaction = TransferConfig {
+                iwidth,
+                awidth: if self.qpi_mode { QspiWidth::QUAD } else { QspiWidth::SING },
+                dwidth: if self.qpi_mode { QspiWidth::QUAD } else { QspiWidth::SING },
+                instruction: cmd,
+                address: Some(dst_offset),
+                dummy: DummyCycles::_0,
+            };
+
+            self.qspi.blocking_write(&bytes[src_offset..(src_offset + to_write)], transaction);
+
+            self.wait_write_finish();
+
+            remaining -= to_write;
+            src_offset += to_write;
+            dst_offset += to_write as u32;
+        }
+
+        Ok(())
     }
 }
