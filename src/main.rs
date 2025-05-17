@@ -75,11 +75,11 @@ async fn main(_spawner: Spawner) -> ! {
         qspi_config,
     );
 
-    let mut flash = FlashMemory::new(qspi).await;
+    let mut flash = FlashMemory::new(qspi);
 
     let flash_id = flash.read_id();
     info!("FLASH ID: {=[u8]:x}", flash_id);
-    flash.enable_mm().await;
+    flash.enable_mm();
     info!("Enabled memory mapped mode");
 
     let qspi_flash = Mutex::new(RefCell::new(flash));
@@ -93,11 +93,51 @@ async fn main(_spawner: Spawner) -> ! {
     info!("active_offset: {:08x}", active_offset);
 
     let target_addr = active_offset;
+    info!("target_addr: 0x{:08x}", target_addr);
 
-    loop {
+    for _ in 0..10 {
         led.toggle();
-        info!("Main: led toggled");
-        Timer::after_millis(500).await;
+        Timer::after_millis(100).await;
+    }
+
+    unsafe {
+        let stack_ptr = core::ptr::read_volatile(target_addr as *const u32);
+        let reset_handler = core::ptr::read_volatile((target_addr + 4) as *const u32);
+
+        info!("stack_ptr: 0x{:08x}", stack_ptr);
+        info!("reset_handler: 0x{:08x}", reset_handler);
+
+        if stack_ptr < 0x2000_0000 || stack_ptr > 0x3000_0000 ||
+           reset_handler < target_addr || reset_handler > (target_addr + 0x100000) {
+            defmt::error!("Failed setting up stack pointer and reset handler!");
+            loop {
+                led.toggle();
+                Timer::after_millis(100).await;
+            }
+        }
+
+        let mut p = cortex_m::Peripherals::steal();
+        p.SCB.invalidate_icache();
+        cortex_m::asm::dsb();
+        p.SCB.disable_icache();
+        p.SCB.disable_dcache(&mut p.CPUID);
+        cortex_m::asm::dsb();
+        cortex_m::asm::isb();
+
+        let mut stk = cortex_m::Peripherals::steal().SYST;
+        stk.set_reload(0);
+        stk.clear_current();
+        stk.disable_counter();
+    }
+
+    for _ in 0..1000 {
+        cortex_m::asm::nop();
+    }
+
+    let bl = embassy_boot_stm32::BootLoader::prepare::<_, _, _, 2048>(config);
+
+    unsafe {
+        bl.load(target_addr);
     }
 }
 
@@ -139,15 +179,15 @@ pub struct FlashMemory<I: Instance> {
 }
 
 impl<I: Instance> FlashMemory<I> {
-    pub async fn new(qspi: Qspi<'static, I, Blocking>) -> Self {
+    pub fn new(qspi: Qspi<'static, I, Blocking>) -> Self {
         let mut memory = Self { qspi, qpi_mode: false, base_address: 0x9000_0000 };
 
-        memory.reset_memory().await;
+        memory.reset_memory();
         memory.enable_quad();
         memory
     }
 
-    pub async fn enter_qpi_mode(&mut self) {
+    pub fn enter_qpi_mode(&mut self) {
         let status = self.read_cr();
         if (status & QE_MASK) == 0 {
             self.write_cr(status | QE_MASK);
@@ -173,13 +213,13 @@ impl<I: Instance> FlashMemory<I> {
         };
 
         self.qpi_mode = true;
-        self.write_enable().await;
+        self.write_enable();
         let data: [u8; 1] = [0x03 << 4];
         self.qspi.blocking_write(&data, transaction);
     }
 
-    pub async fn enable_mm(&mut self) {
-        self.enter_qpi_mode().await;
+    pub fn enable_mm(&mut self) {
+        self.enter_qpi_mode();
 
         let config = TransferConfig {
             instruction: CMD_FAST_READ_QUAD_IO,
@@ -206,7 +246,7 @@ impl<I: Instance> FlashMemory<I> {
         self.write_cr(cr & (!(0x02)));
     }
 
-    async fn exec_command(&mut self, cmd: u8) {
+    fn exec_command(&mut self, cmd: u8) {
         let transaction = TransferConfig {
             iwidth: QspiWidth::SING,
             awidth: QspiWidth::NONE,
@@ -219,7 +259,7 @@ impl<I: Instance> FlashMemory<I> {
         self.qspi.blocking_command(transaction);
     }
 
-    async fn exec_command_4(&mut self, cmd: u8) {
+    fn exec_command_4(&mut self, cmd: u8) {
         let transaction = TransferConfig {
             iwidth: QspiWidth::QUAD,
             awidth: QspiWidth::NONE,
@@ -232,7 +272,7 @@ impl<I: Instance> FlashMemory<I> {
         self.qspi.blocking_command(transaction);
     }
 
-    pub async fn write_enable(&mut self) {
+    pub fn write_enable(&mut self) {
         let transaction = TransferConfig {
             iwidth: QspiWidth::SING,
             awidth: QspiWidth::NONE,
@@ -246,12 +286,12 @@ impl<I: Instance> FlashMemory<I> {
 
     }
 
-    pub async fn reset_memory(&mut self) {
-        self.exec_command_4(CMD_ENABLE_RESET).await;
-        self.exec_command_4(CMD_RESET).await;
-        self.exec_command(CMD_ENABLE_RESET).await;
-        self.exec_command(CMD_RESET).await;
-        self.wait_write_finish().await;
+    pub fn reset_memory(&mut self) {
+        self.exec_command_4(CMD_ENABLE_RESET);
+        self.exec_command_4(CMD_RESET);
+        self.exec_command(CMD_ENABLE_RESET);
+        self.exec_command(CMD_RESET);
+        self.wait_write_finish();
     }
 
     pub fn read_id(&mut self) -> [u8; 3] {
@@ -280,11 +320,11 @@ impl<I: Instance> FlashMemory<I> {
         self.qspi.blocking_read(buffer, transaction);
     }
 
-    async fn wait_write_finish(&mut self) {
+    fn wait_write_finish(&mut self) {
         while (self.read_sr() & 0x01) != 0 {}
     }
 
-    async fn perform_erase(&mut self, addr: u32, instruction: u8) {
+    fn perform_erase(&mut self, addr: u32, instruction: u8) {
         let transaction = TransferConfig {
             iwidth: QspiWidth::SING,
             awidth: QspiWidth::SING,
@@ -294,30 +334,30 @@ impl<I: Instance> FlashMemory<I> {
             dummy: DummyCycles::_0,
             ..Default::default()
         };
-        self.write_enable().await;
+        self.write_enable();
         self.qspi.blocking_command(transaction);
-        self.wait_write_finish().await;
+        self.wait_write_finish();
     }
 
-    pub async fn erase_sector(&mut self, addr: u32) {
-        self.perform_erase(addr, CMD_SECTOR_ERASE).await;
+    pub fn erase_sector(&mut self, addr: u32) {
+        self.perform_erase(addr, CMD_SECTOR_ERASE);
     }
 
-    pub async fn erase_block_32k(&mut self, addr: u32) {
-        self.perform_erase(addr, CMD_BLOCK_ERASE_32K).await;
+    pub fn erase_block_32k(&mut self, addr: u32) {
+        self.perform_erase(addr, CMD_BLOCK_ERASE_32K);
     }
 
-    pub async fn erase_block_64k(&mut self, addr: u32) {
-        self.perform_erase(addr, CMD_BLOCK_ERASE_64K).await;
+    pub fn erase_block_64k(&mut self, addr: u32) {
+        self.perform_erase(addr, CMD_BLOCK_ERASE_64K);
     }
 
-    pub async fn erase_chip(&mut self) {
-        self.write_enable().await;
-        self.exec_command(CMD_CHIP_ERASE).await;
-        self.wait_write_finish().await;
+    pub fn erase_chip(&mut self) {
+        self.write_enable();
+        self.exec_command(CMD_CHIP_ERASE);
+        self.wait_write_finish();
     }
 
-    async fn write_page(&mut self, addr: u32, buffer: &[u8], len: usize) {
+    fn write_page(&mut self, addr: u32, buffer: &[u8], len: usize) {
         assert!(
             (len as u32 + (addr & 0x000000ff)) <= MEMORY_PAGE_SIZE as u32,
             "write_page(): page write length exceeds page boundary (len = {}, addr = {:X}",
@@ -334,12 +374,12 @@ impl<I: Instance> FlashMemory<I> {
             dummy: DummyCycles::_0,
             ..Default::default()
         };
-        self.write_enable().await;
+        self.write_enable();
         self.qspi.blocking_write(buffer, transaction);
-        self.wait_write_finish().await;
+        self.wait_write_finish();
     }
 
-    pub async fn write_memory(&mut self, addr: u32, buffer: &[u8]) {
+    pub fn write_memory(&mut self, addr: u32, buffer: &[u8]) {
         let mut left = buffer.len();
         let mut place = addr;
         let mut chunk_start = 0;
@@ -348,7 +388,7 @@ impl<I: Instance> FlashMemory<I> {
             let max_chunk_size = MEMORY_PAGE_SIZE - (place & 0x000000ff) as usize;
             let chunk_size = if left >= max_chunk_size { max_chunk_size } else { left };
             let chunk = &buffer[chunk_start..(chunk_start + chunk_size)];
-            self.write_page(place, chunk, chunk_size).await;
+            self.write_page(place, chunk, chunk_size);
             place += chunk_size as u32;
             left -= chunk_size;
             chunk_start += chunk_size;
